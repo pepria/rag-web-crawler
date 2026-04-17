@@ -1,0 +1,7 @@
+output_markdown/
+output_pdf/
+output_cleaned/
+cleaning_report.json
+__pycache__/
+*.pyc
+.env
