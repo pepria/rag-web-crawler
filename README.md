@@ -20,7 +20,7 @@ crawl4ai-setup        # installs Playwright browsers (run once)
 
 ## Quick Start
 
-Scrape a single course:
+Scrape a single course (including professor pages):
 ```bash
 python scraper.py --url https://corsi.unibo.it/2cycle/artificial-intelligence
 ```
@@ -33,7 +33,17 @@ python scraper.py \
   --max-pages 300
 ```
 
-Use built-in default seeds (main unibo homepage + a few courses):
+Use a predefined course preset:
+```bash
+python scraper.py --preset ai-msc --max-pages 300
+```
+
+Load seed URLs from a text file (one URL per line, `#` for comments):
+```bash
+python scraper.py --url-file my_courses.txt --max-pages 500
+```
+
+Use built-in default seeds:
 ```bash
 python scraper.py --max-pages 1000
 ```
@@ -47,12 +57,27 @@ python clean.py
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--url URL` | built-in seeds | Seed URL to start from (repeatable) |
+| `--url URL` | — | Seed URL to start from (repeatable) |
+| `--url-file FILE` | — | Text file with seed URLs, one per line |
+| `--preset NAME` | — | Use a predefined course set (see below) |
 | `--max-pages N` | `5000` | Max new pages to crawl per run |
 | `--output-dir DIR` | `output_markdown` | Where to save markdown files |
 | `--pdf-dir DIR` | `output_pdf` | Where to save extracted PDF text |
 | `--concurrency N` | `5` | Parallel requests |
 | `--retry` | — | Retry failed pages from previous run |
+
+URL sources are merged in this priority order: `--url` > `--url-file` > `--preset` > built-in defaults.
+
+## Available Presets
+
+| Preset | Description |
+|--------|-------------|
+| `ai-msc` | AI Master's degree (corsi.unibo.it) + faculty pages |
+| `cs-msc` | Computer Science Master's degree + faculty pages |
+| `data-science` | Statistical Sciences / Data Science degree + faculty pages |
+| `robotics` | Automotive Engineering degree + faculty pages |
+
+Professor personal pages (`/sitoweb/`) are crawled automatically when linked from faculty pages.
 
 ## Cleaner Options
 

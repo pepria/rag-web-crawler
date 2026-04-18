@@ -38,14 +38,40 @@ DEFAULT_SEED_URLS = [
     "https://corsi.unibo.it/2cycle/artificial-intelligence",
 ]
 
-BOOSTED_PREFIXES = ("/en/study", "/en/research")
+# Predefined course sets for --preset. Each entry is a list of seed URLs.
+# Faculty pages are included so professor /sitoweb/ links are discovered.
+PRESET_URLS: dict[str, list[str]] = {
+    "ai-msc": [
+        "https://corsi.unibo.it/2cycle/artificial-intelligence",
+        "https://corsi.unibo.it/2cycle/artificial-intelligence/faculty",
+        "https://corsi.unibo.it/2cycle/artificial-intelligence/programme",
+        "https://corsi.unibo.it/2cycle/artificial-intelligence/overview",
+    ],
+    "cs-msc": [
+        "https://corsi.unibo.it/2cycle/ComputerScience",
+        "https://corsi.unibo.it/2cycle/ComputerScience/faculty",
+        "https://corsi.unibo.it/2cycle/ComputerScience/programme",
+        "https://corsi.unibo.it/2cycle/ComputerScience/overview",
+    ],
+    "data-science": [
+        "https://corsi.unibo.it/2cycle/StatisticalSciences",
+        "https://corsi.unibo.it/2cycle/StatisticalSciences/faculty",
+        "https://corsi.unibo.it/2cycle/StatisticalSciences/programme",
+    ],
+    "robotics": [
+        "https://corsi.unibo.it/2cycle/AutomotiveEngineering",
+        "https://corsi.unibo.it/2cycle/AutomotiveEngineering/faculty",
+        "https://corsi.unibo.it/2cycle/AutomotiveEngineering/programme",
+    ],
+}
+
+BOOSTED_PREFIXES = ("/en/study", "/en/research", "/sitoweb/")
 
 SHALLOW_URL_PATTERNS = ["/notice-board", "/unibomagazine", "/events", "/news"]
 
 SKIP_URL_FRAGMENTS = [
     "/it/", "/magistrale/", "/laurea/",
     "@@multilingual-selector", "/uniboweb", "/concilium", "/speis",
-    "/sitoweb/",
     "/university/support-the-alma-mater",
     "/university/transparent-administration",
     "/university/contracting-and-sales",
@@ -435,22 +461,34 @@ async def retry_failed(output_dir: Path, pdf_dir: Path):
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
+    preset_names = ", ".join(PRESET_URLS.keys())
     parser = argparse.ArgumentParser(
         description="BFS web scraper for the University of Bologna website.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Examples:
   python scraper.py
   python scraper.py --url https://corsi.unibo.it/2cycle/artificial-intelligence
   python scraper.py --url https://corsi.unibo.it/2cycle/artificial-intelligence \\
                     --url https://www.unibo.it/en/homepage --max-pages 300
+  python scraper.py --url-file my_courses.txt --max-pages 500
+  python scraper.py --preset ai-msc --max-pages 300
   python scraper.py --retry
+
+Available presets: {preset_names}
         """,
     )
     parser.add_argument(
         "--url", action="append", dest="urls", metavar="URL",
-        help="Seed URL to start crawling from (can be repeated). "
-             "Defaults to the built-in seed list if omitted.",
+        help="Seed URL to start crawling from (can be repeated).",
+    )
+    parser.add_argument(
+        "--url-file", metavar="FILE",
+        help="Path to a text file with seed URLs, one per line (# lines are ignored).",
+    )
+    parser.add_argument(
+        "--preset", choices=list(PRESET_URLS.keys()), metavar="NAME",
+        help=f"Use a predefined set of course seed URLs. Choices: {preset_names}.",
     )
     parser.add_argument(
         "--max-pages", type=int, default=5000, metavar="N",
@@ -486,5 +524,35 @@ if __name__ == "__main__":
     if args.retry:
         asyncio.run(retry_failed(output_dir, pdf_dir))
     else:
-        seed_urls = args.urls if args.urls else DEFAULT_SEED_URLS
+        # URL priority: --url > --url-file > --preset > built-in defaults
+        seed_urls: list[str] = []
+
+        if args.urls:
+            seed_urls.extend(args.urls)
+
+        if args.url_file:
+            url_file = Path(args.url_file)
+            if not url_file.exists():
+                print(f"[ERROR] --url-file not found: {url_file}")
+                raise SystemExit(1)
+            file_urls = [
+                line.strip()
+                for line in url_file.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            print(f"[URL-FILE] Loaded {len(file_urls)} URLs from {url_file}")
+            seed_urls.extend(file_urls)
+
+        if args.preset:
+            preset_urls = PRESET_URLS[args.preset]
+            print(f"[PRESET] '{args.preset}': {len(preset_urls)} seed URLs")
+            seed_urls.extend(preset_urls)
+
+        if not seed_urls:
+            seed_urls = DEFAULT_SEED_URLS
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        seed_urls = [u for u in seed_urls if not (u in seen or seen.add(u))]
+
         asyncio.run(crawl(seed_urls, args.max_pages, output_dir, pdf_dir, args.concurrency))
