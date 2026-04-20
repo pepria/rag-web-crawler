@@ -43,25 +43,15 @@ DEFAULT_SEED_URLS = [
 PRESET_URLS: dict[str, list[str]] = {
     "ai-msc": [
         "https://corsi.unibo.it/2cycle/artificial-intelligence",
-        "https://corsi.unibo.it/2cycle/artificial-intelligence/faculty",
-        "https://corsi.unibo.it/2cycle/artificial-intelligence/programme",
-        "https://corsi.unibo.it/2cycle/artificial-intelligence/overview",
     ],
     "cs-msc": [
         "https://corsi.unibo.it/2cycle/ComputerScience",
-        "https://corsi.unibo.it/2cycle/ComputerScience/faculty",
-        "https://corsi.unibo.it/2cycle/ComputerScience/programme",
-        "https://corsi.unibo.it/2cycle/ComputerScience/overview",
     ],
     "data-science": [
         "https://corsi.unibo.it/2cycle/StatisticalSciences",
-        "https://corsi.unibo.it/2cycle/StatisticalSciences/faculty",
-        "https://corsi.unibo.it/2cycle/StatisticalSciences/programme",
     ],
     "robotics": [
         "https://corsi.unibo.it/2cycle/AutomotiveEngineering",
-        "https://corsi.unibo.it/2cycle/AutomotiveEngineering/faculty",
-        "https://corsi.unibo.it/2cycle/AutomotiveEngineering/programme",
     ],
 }
 

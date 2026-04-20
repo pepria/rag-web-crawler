@@ -72,12 +72,12 @@ URL sources are merged in this priority order: `--url` > `--url-file` > `--prese
 
 | Preset | Description |
 |--------|-------------|
-| `ai-msc` | AI Master's degree (corsi.unibo.it) + faculty pages |
-| `cs-msc` | Computer Science Master's degree + faculty pages |
-| `data-science` | Statistical Sciences / Data Science degree + faculty pages |
-| `robotics` | Automotive Engineering degree + faculty pages |
+| `ai-msc` | AI Master's degree (`corsi.unibo.it/2cycle/artificial-intelligence`) |
+| `cs-msc` | Computer Science Master's degree |
+| `data-science` | Statistical Sciences / Data Science degree |
+| `robotics` | Automotive Engineering degree |
 
-Professor personal pages (`/sitoweb/`) are crawled automatically when linked from faculty pages.
+Subpages (faculty, programme, overview, etc.) and professor personal pages (`/sitoweb/`) are discovered and crawled automatically via BFS link following.
 
 ## Cleaner Options
 
