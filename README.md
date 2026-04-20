@@ -20,7 +20,7 @@ crawl4ai-setup        # installs Playwright browsers (run once)
 
 ## Quick Start
 
-Scrape a single course (including professor pages):
+Scrape a single course 
 ```bash
 python scraper.py --url https://corsi.unibo.it/2cycle/artificial-intelligence
 ```
