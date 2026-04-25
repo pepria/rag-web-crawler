@@ -52,16 +52,28 @@ def is_junk(text: str) -> str | None:
 
 _COOKIE_BAR = re.compile(
     r"(?:\[Essential cookies only\]|\[Solo cookie necessari\]|"
-    r"\[Accetta tutti i cookie\]|chefcookie__decline)",
+    r"\[Accetta tutti i cookie\]|chefcookie__decline|"
+    r"\[Personalizza cookie\]|\[Impostazione cookie\])",
 )
 
 _YOU_ARE_HERE = re.compile(r"You are here:")
+
+_COOKIE_SECTION_START = re.compile(
+    r"#{1,2} (?:This website uses cookies|Questo sito web utilizza i cookie)"
+)
 
 
 def truncate_at_boilerplate(text: str) -> str:
     m = _COOKIE_BAR.search(text)
     if m:
-        text = text[:m.start()]
+        heading = _COOKIE_SECTION_START.search(text)
+        # Cookie banner at the top (sitoweb pages): remove banner, keep content after
+        if heading and heading.start() < m.start() and heading.start() < 500:
+            end_of_line = text.find("\n", m.end())
+            text = text[end_of_line + 1:] if end_of_line != -1 else ""
+        else:
+            # Cookie banner at the bottom (regular pages): keep content before
+            text = text[:m.start()]
 
     matches = list(_YOU_ARE_HERE.finditer(text))
     if len(matches) >= 2:
@@ -81,8 +93,8 @@ def truncate_at_boilerplate(text: str) -> str:
 # ── Residual cleaning ─────────────────────────────────────────────────────────
 
 _COOKIE_HEADING = re.compile(
-    r"#{1,2} This website uses cookies.*?"
-    r"(?=\[Essential cookies only\]|\Z)",
+    r"#{1,2} (?:This website uses cookies|Questo sito web utilizza i cookie).*?"
+    r"(?=\[Essential cookies only\]|\[Personalizza cookie\]|\[Impostazione cookie\]|\Z)",
     re.DOTALL,
 )
 

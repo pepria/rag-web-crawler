@@ -126,13 +126,13 @@ def is_shallow_url(url: str) -> bool:
     return any(pat in url for pat in SHALLOW_URL_PATTERNS)
 
 
-def collect_links(result, source_url: str) -> tuple[list[str], list[str], list[str]]:
+def collect_links(result, source_url: str, all_pdfs: bool = False, restrict_prefixes: list[str] | None = None) -> tuple[list[str], list[str], list[str]]:
     """Return (page_links, syllabus_pdf_urls, other_pdf_urls)."""
     page_links, syllabus_pdfs, other_pdfs = [], [], []
     if not result.links:
         return page_links, syllabus_pdfs, other_pdfs
 
-    source_is_course_site = urlparse(source_url).netloc == SYLLABUS_SOURCE_DOMAIN
+    source_is_course_site = all_pdfs or urlparse(source_url).netloc == SYLLABUS_SOURCE_DOMAIN
     all_links = result.links.get("internal", []) + result.links.get("external", [])
 
     for link in all_links:
@@ -140,22 +140,30 @@ def collect_links(result, source_url: str) -> tuple[list[str], list[str], list[s
         if not href or not href.startswith("http"):
             continue
 
+        parsed = urlparse(href)
+
         # Reject malformed concatenated URLs
-        if "://" in urlparse(href).path:
+        if "://" in parsed.path:
             continue
 
         if href.lower().endswith(".pdf") or "/@@download/" in href.lower():
             (syllabus_pdfs if source_is_course_site else other_pdfs).append(href)
             continue
 
-        if any(urlparse(href).path.lower().endswith(ext) for ext in SKIP_EXTENSIONS):
+        if any(parsed.path.lower().endswith(ext) for ext in SKIP_EXTENSIONS):
             continue
 
-        if urlparse(href).netloc not in ALLOWED_DOMAINS:
+        if parsed.netloc not in ALLOWED_DOMAINS:
             continue
 
         if any(x in href for x in SKIP_URL_FRAGMENTS):
             continue
+
+        if restrict_prefixes:
+            is_professor_page = "/sitoweb/" in href
+            matches_prefix = any(href.startswith(p) for p in restrict_prefixes)
+            if not matches_prefix and not is_professor_page:
+                continue
 
         page_links.append(href.split("?")[0])
 
@@ -221,6 +229,8 @@ async def scrape_page(
     syllabus_queue: set,
     pdf_link_queue: set,
     output_dir: Path,
+    all_pdfs: bool = False,
+    restrict_prefixes: list[str] | None = None,
 ) -> tuple[bool, list[str]]:
     shallow = is_shallow_url(url)
     filepath = output_dir / url_to_filename(url)
@@ -247,7 +257,7 @@ async def scrape_page(
             label = "SHALLOW" if shallow else "OK"
             print(f"  [{label}]  {filepath.name}  ({len(markdown):,} chars)")
 
-        page_links, syllabus_pdfs, other_pdfs = collect_links(result, url)
+        page_links, syllabus_pdfs, other_pdfs = collect_links(result, url, all_pdfs, restrict_prefixes)
         syllabus_queue.update(syllabus_pdfs)
         pdf_link_queue.update(other_pdfs)
 
@@ -279,7 +289,8 @@ def load_checkpoint(output_dir: Path) -> dict | None:
     if cp.exists():
         with open(cp, encoding="utf-8") as f:
             data = json.load(f)
-        print(f"[RESUME] Checkpoint found: {len(data['visited'])} visited, {len(data['queue'])} queued")
+        queue_len = len(data["queue"]) if isinstance(data.get("queue"), list) else 0
+        print(f"[RESUME] Checkpoint found: {len(data['visited'])} visited, {queue_len} queued")
         return data
 
     visited_urls = []
@@ -307,7 +318,7 @@ def _priority(url: str, depth: int) -> int:
     return depth * 2 if boosted else depth * 2 + 1
 
 
-async def crawl(seed_urls: list[str], max_pages: int, output_dir: Path, pdf_dir: Path, concurrency: int):
+async def crawl(seed_urls: list[str], max_pages: int, output_dir: Path, pdf_dir: Path, concurrency: int, all_pdfs: bool = False, restrict_prefixes: list[str] | None = None):
     print(f"\n=== CRAWL (max_pages={max_pages}) ===")
     print(f"Seeds: {seed_urls}\n")
 
@@ -351,10 +362,12 @@ async def crawl(seed_urls: list[str], max_pages: int, output_dir: Path, pdf_dir:
     pages_since_checkpoint = 0
     visited_at_start = len(visited)
 
+    unlimited = max_pages <= 0
+
     async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
-        while heap and (len(visited) - visited_at_start) < max_pages:
+        while heap and (unlimited or (len(visited) - visited_at_start) < max_pages):
             batch = []
-            while heap and len(batch) < concurrency and (len(visited) - visited_at_start) < max_pages:
+            while heap and len(batch) < concurrency and (unlimited or (len(visited) - visited_at_start) < max_pages):
                 score, _, depth, url = heapq.heappop(heap)
                 if url in visited:
                     continue
@@ -365,14 +378,15 @@ async def crawl(seed_urls: list[str], max_pages: int, output_dir: Path, pdf_dir:
                 continue
 
             results = await asyncio.gather(
-                *[scrape_page(crawler, url, syllabus_queue, pdf_link_queue, output_dir)
+                *[scrape_page(crawler, url, syllabus_queue, pdf_link_queue, output_dir, all_pdfs, restrict_prefixes)
                   for _, _, url in batch]
             )
 
             for (score, depth, url), (ok, children) in zip(batch, results):
                 tag = "*" if score == depth * 2 else " "
                 new_count = len(visited) - visited_at_start
-                print(f"[{new_count}/{max_pages}] d={depth}{tag} {url}")
+                limit_str = "∞" if unlimited else str(max_pages)
+                print(f"[{new_count}/{limit_str}] d={depth}{tag} {url}")
                 log.append({"url": url, "status": "ok" if ok else "skip", "depth": depth})
                 for child in children:
                     if child not in visited:
@@ -400,7 +414,7 @@ async def crawl(seed_urls: list[str], max_pages: int, output_dir: Path, pdf_dir:
         async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
             for url in failed:
                 print(f"  Retrying: {url}")
-                ok, _ = await scrape_page(crawler, url, syllabus_queue, pdf_link_queue, output_dir)
+                ok, _ = await scrape_page(crawler, url, syllabus_queue, pdf_link_queue, output_dir, all_pdfs, restrict_prefixes)
                 if ok:
                     retry_ok += 1
         print(f"\nRetry: {retry_ok}/{len(failed)} recovered")
@@ -497,6 +511,15 @@ Available presets: {preset_names}
         help="Number of pages crawled in parallel (default: 5).",
     )
     parser.add_argument(
+        "--all-pdfs", action="store_true",
+        help="Extract text from all PDFs found, not just those linked from corsi.unibo.it.",
+    )
+    parser.add_argument(
+        "--restrict-prefix", action="append", dest="restrict_prefixes", metavar="URL_PREFIX",
+        help="Only follow links that start with this URL prefix (can be repeated). "
+             "Professor pages (/sitoweb/) are always allowed as an exception.",
+    )
+    parser.add_argument(
         "--retry", action="store_true",
         help="Retry previously failed pages from _crawl_summary.json.",
     )
@@ -545,4 +568,4 @@ if __name__ == "__main__":
         seen: set[str] = set()
         seed_urls = [u for u in seed_urls if not (u in seen or seen.add(u))]
 
-        asyncio.run(crawl(seed_urls, args.max_pages, output_dir, pdf_dir, args.concurrency))
+        asyncio.run(crawl(seed_urls, args.max_pages, output_dir, pdf_dir, args.concurrency, args.all_pdfs, args.restrict_prefixes))
