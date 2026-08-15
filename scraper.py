@@ -9,7 +9,10 @@ Usage:
   python scraper.py --url URL1 --url URL2 --max-pages 200
   python scraper.py --retry
 """
-
+import argparse
+import asyncio
+import hashlib        
+import heapq
 import argparse
 import asyncio
 import heapq
@@ -119,7 +122,8 @@ def url_to_filename(url: str, ext: str = ".md") -> str:
     parsed = urlparse(url)
     name = parsed.netloc + parsed.path
     name = re.sub(r"[^\w\-]", "_", name).strip("_")
-    return name[:180] + ext
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+    return f"{name[:160]}__{digest}{ext}
 
 
 def is_shallow_url(url: str) -> bool:
@@ -167,8 +171,7 @@ def collect_links(result, source_url: str, all_pdfs: bool = False, restrict_pref
 
         page_links.append(href.split("?")[0])
 
-    return list(set(page_links)), list(set(syllabus_pdfs)), list(set(other_pdfs))
-
+    return sorted(set(page_links)), sorted(set(syllabus_pdfs)), sorted(set(other_pdfs))
 
 # ── PDF handling ──────────────────────────────────────────────────────────────
 
