@@ -1,232 +1,578 @@
 """
-Data cleaning pipeline for scraped Unibo markdown files.
-
-Reads from an input directory (default: output_markdown/),
-writes cleaned files to an output directory (default: output_cleaned/).
-
-Stages:
-  1. Junk filter    — removes login pages, 404s, cookie-only pages
-  2. Truncation     — cuts at first cookie action bar (removes boilerplate
-                      and duplicate content blocks that follow it)
-  3. Content clean  — strips residual cookie headings, copyright footers,
-                      and excess blank lines
-  4. Min-length     — discards files with < MIN_CHARS of useful content
-  5. Deduplication  — keeps one representative per identical-body group
+Unibo Website Scraper
+BFS crawler for www.unibo.it / corsi.unibo.it / www.eng.unibo.it.
+Converts HTML pages to Markdown and extracts text from course PDFs.
 
 Usage:
-  python clean.py
-  python clean.py --input-dir output_markdown --output-dir output_cleaned
-  python clean.py --min-chars 500
+  python scraper.py                                         # default seeds, 5000 pages
+  python scraper.py --url https://corsi.unibo.it/2cycle/artificial-intelligence
+  python scraper.py --url URL1 --url URL2 --max-pages 200
+  python scraper.py --retry
 """
 
 import argparse
+import asyncio
 import hashlib
-import json
+import heapq
 import re
-from collections import defaultdict
+import json
+import io
+import httpx
+from itertools import count
 from pathlib import Path
+from urllib.parse import urlparse
+
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+from pypdf import PdfReader
 
 
-MIN_CHARS_DEFAULT = 200
+# ── Crawl config ──────────────────────────────────────────────────────────────
 
+ALLOWED_DOMAINS = {"www.unibo.it", "corsi.unibo.it", "www.eng.unibo.it"}
 
-# ── Junk detection ────────────────────────────────────────────────────────────
+SYLLABUS_SOURCE_DOMAIN = "corsi.unibo.it"
 
-# These pages render in the language of the browser session, so every signal
-# must be listed in all three locales or junk leaks through on another machine.
-JUNK_SIGNALS = [
-    # login
-    "用户帐户", "User account", "Account utente",
-    "使我保持登录状态", "Keep me signed in", "Ricordami",
-    "Enter the University institutional credentials",
-    "Inserisci le credenziali istituzionali",
-    # errors
-    "We can't find the page you are looking for",
-    "Sorry, the requested page cannot be found",
-    "Non riusciamo a trovare la pagina",
-    "页面未找到",
+DEFAULT_SEED_URLS = [
+    "https://www.unibo.it/en/homepage",
+    "https://www.unibo.it/en/enrolled-students",
+    "https://corsi.unibo.it/2cycle/artificial-intelligence",
 ]
 
+# Predefined course sets for --preset. Each entry is a list of seed URLs.
+# Faculty pages are included so professor /sitoweb/ links are discovered.
+PRESET_URLS: dict[str, list[str]] = {
+    "ai-msc": [
+        "https://corsi.unibo.it/2cycle/artificial-intelligence",
+    ],
+    "cs-msc": [
+        "https://corsi.unibo.it/2cycle/ComputerScience",
+    ],
+    "data-science": [
+        "https://corsi.unibo.it/2cycle/StatisticalSciences",
+    ],
+    "robotics": [
+        "https://corsi.unibo.it/2cycle/AutomotiveEngineering",
+    ],
+}
 
-def is_junk(text: str) -> str | None:
-    for sig in JUNK_SIGNALS:
-        if sig in text:
-            return f"junk:{sig[:40]}"
+BOOSTED_PREFIXES = ("/en/study", "/en/research", "/sitoweb/")
+
+SHALLOW_URL_PATTERNS = ["/notice-board", "/unibomagazine", "/events", "/news"]
+
+SKIP_URL_FRAGMENTS = [
+    "/it/", "/magistrale/", "/laurea/",
+    "@@multilingual-selector", "/uniboweb", "/concilium", "/speis",
+    "/university/support-the-alma-mater",
+    "/university/transparent-administration",
+    "/university/contracting-and-sales",
+    "/research/projects-and-initiatives",
+    "#", "login", "logout",
+    "sol/welcome", "almaesami", "solcampus",
+    "timetable", "exam-dates",
+    "about-the-website", "accessibility",
+    "cookie", "privacy-policy",
+    "@@print", "?print", "?search=", "?q=",
+]
+
+SKIP_EXTENSIONS = {".docx", ".xlsx", ".zip", ".ppt", ".pptx", ".doc"}
+
+COURSE_SUBPAGES = [
+    "overview", "admission", "programme", "faculty", "studying",
+    "contacts", "course-structure-diagram", "opportunities",
+    "how-to-enrol", "guidance", "prospects", "job-opportunities",
+    "notice-board", "advisory-board", "degree-programme-tutor",
+    "balancing-study-and-work", "registering-for-subsequent-years",
+    "lecture-attendance", "final-examination", "examinations",
+    "degree-programme-director-and-board", "degree-committees",
+    "student-administration-offices", "programme-quality",
+]
+
+CHECKPOINT_INTERVAL = 20
+
+
+# ── Crawler configs ───────────────────────────────────────────────────────────
+
+_MD_OPTIONS = {"ignore_images": True, "body_width": 0, "tables": True, "unicode_snob": True}
+
+CRAWLER_CONFIG = CrawlerRunConfig(
+    cache_mode=CacheMode.BYPASS,
+    markdown_generator=DefaultMarkdownGenerator(options={**_MD_OPTIONS, "ignore_links": False}),
+    wait_until="domcontentloaded",
+    page_timeout=30000,
+    verbose=False,
+    css_selector="main, #content, .page-content, article, [role='main'], body",
+)
+
+TITLES_ONLY_CONFIG = CrawlerRunConfig(
+    cache_mode=CacheMode.BYPASS,
+    markdown_generator=DefaultMarkdownGenerator(options={**_MD_OPTIONS, "ignore_links": False}),
+    wait_until="domcontentloaded",
+    page_timeout=30000,
+    verbose=False,
+    css_selector="h1, h2, h3, h4, .title, [class*='title'], [class*='heading']",
+)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def url_to_filename(url: str, ext: str = ".md") -> str:
+    parsed = urlparse(url)
+    name = parsed.netloc + parsed.path
+    name = re.sub(r"[^\w\-]", "_", name).strip("_")
+    # Digest of the FULL url: two long URLs sharing a 160-char prefix would
+    # otherwise collide and the second page be dropped by the exists() branch.
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+    return f"{name[:160]}__{digest}{ext}"
+
+
+def is_shallow_url(url: str) -> bool:
+    return any(pat in url for pat in SHALLOW_URL_PATTERNS)
+
+
+def collect_links(result, source_url: str, all_pdfs: bool = False, restrict_prefixes: list[str] | None = None) -> tuple[list[str], list[str], list[str]]:
+    """Return (page_links, syllabus_pdf_urls, other_pdf_urls)."""
+    page_links, syllabus_pdfs, other_pdfs = [], [], []
+    if not result.links:
+        return page_links, syllabus_pdfs, other_pdfs
+
+    source_is_course_site = all_pdfs or urlparse(source_url).netloc == SYLLABUS_SOURCE_DOMAIN
+    all_links = result.links.get("internal", []) + result.links.get("external", [])
+
+    for link in all_links:
+        href = link.get("href", "")
+        if not href or not href.startswith("http"):
+            continue
+
+        parsed = urlparse(href)
+
+        # Reject malformed concatenated URLs
+        if "://" in parsed.path:
+            continue
+
+        if href.lower().endswith(".pdf") or "/@@download/" in href.lower():
+            (syllabus_pdfs if source_is_course_site else other_pdfs).append(href)
+            continue
+
+        if any(parsed.path.lower().endswith(ext) for ext in SKIP_EXTENSIONS):
+            continue
+
+        if parsed.netloc not in ALLOWED_DOMAINS:
+            continue
+
+        if any(x in href for x in SKIP_URL_FRAGMENTS):
+            continue
+
+        if restrict_prefixes:
+            is_professor_page = "/sitoweb/" in href
+            matches_prefix = any(href.startswith(p) for p in restrict_prefixes)
+            if not matches_prefix and not is_professor_page:
+                continue
+
+        page_links.append(href.split("?")[0])
+
+    # sorted(), not list(set()): string hashing is randomised per process, so
+    # list(set(...)) changes the BFS enqueue order every run, which changes
+    # which pages survive the --max-pages cut.
+    return sorted(set(page_links)), sorted(set(syllabus_pdfs)), sorted(set(other_pdfs))
+
+
+# ── PDF handling ──────────────────────────────────────────────────────────────
+
+async def download_and_extract_pdf(pdf_url: str) -> str | None:
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(pdf_url, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+        reader = PdfReader(io.BytesIO(resp.content))
+        pages_text = [
+            f"### Page {i}\n\n{page.extract_text().strip()}"
+            for i, page in enumerate(reader.pages, 1)
+            if (page.extract_text() or "").strip()
+        ]
+        return "\n\n".join(pages_text) if pages_text else None
+    except Exception as e:
+        print(f"    [PDF ERR] {pdf_url} — {e}")
+        return None
+
+
+async def process_syllabus_pdfs(pdf_urls: set, pdf_dir: Path):
+    if not pdf_urls:
+        return
+    print(f"\n=== SYLLABUS PDFs ({len(pdf_urls)}) ===\n")
+    ok = 0
+    for pdf_url in sorted(pdf_urls):
+        outpath = pdf_dir / url_to_filename(pdf_url)
+        if outpath.exists():
+            print(f"  [CACHED] {outpath.name}")
+            ok += 1
+            continue
+        print(f"  Extracting: {pdf_url}")
+        text = await download_and_extract_pdf(pdf_url)
+        if text:
+            with open(outpath, "w", encoding="utf-8") as f:
+                f.write(f"# PDF Source: {pdf_url}\n\n{text}")
+            print(f"    → saved ({len(text):,} chars)")
+            ok += 1
+        else:
+            print(f"    → no extractable text")
+    print(f"\nSyllabus PDFs: {ok}/{len(pdf_urls)} extracted → {pdf_dir}/")
+
+
+def save_pdf_links(pdf_urls: set, output_dir: Path):
+    if not pdf_urls:
+        return
+    ref_path = output_dir / "_pdf_references.json"
+    with open(ref_path, "w", encoding="utf-8") as f:
+        json.dump(sorted(pdf_urls), f, indent=2, ensure_ascii=False)
+    print(f"PDF links saved: {len(pdf_urls)} → {ref_path}")
+
+
+# ── Page scraping ─────────────────────────────────────────────────────────────
+
+async def scrape_page(
+    crawler: AsyncWebCrawler,
+    url: str,
+    syllabus_queue: set,
+    pdf_link_queue: set,
+    output_dir: Path,
+    all_pdfs: bool = False,
+    restrict_prefixes: list[str] | None = None,
+) -> tuple[bool, list[str]]:
+    shallow = is_shallow_url(url)
+    filepath = output_dir / url_to_filename(url)
+    try:
+        result = await crawler.arun(url=url, config=TITLES_ONLY_CONFIG if shallow else CRAWLER_CONFIG)
+
+        if not result.success:
+            print(f"  [FAIL] {result.error_message}")
+            return False, []
+
+        markdown = result.markdown.raw_markdown if result.markdown else ""
+        if not markdown or len(markdown.strip()) < 50:
+            print(f"  [SKIP] too short ({len(markdown)} chars)")
+            return False, []
+
+        if filepath.exists():
+            print(f"  [CACHED] {filepath.name} — collecting links only")
+        else:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(f"# Source: {url}\n")
+                if shallow:
+                    f.write("<!-- titles only -->\n")
+                f.write(f"\n{markdown}")
+            label = "SHALLOW" if shallow else "OK"
+            print(f"  [{label}]  {filepath.name}  ({len(markdown):,} chars)")
+
+        page_links, syllabus_pdfs, other_pdfs = collect_links(result, url, all_pdfs, restrict_prefixes)
+        syllabus_queue.update(syllabus_pdfs)
+        pdf_link_queue.update(other_pdfs)
+
+        return True, ([] if shallow else page_links)
+
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        return False, []
+
+
+# ── Checkpoint ────────────────────────────────────────────────────────────────
+
+def checkpoint_path(output_dir: Path) -> Path:
+    return output_dir / "_checkpoint.json"
+
+
+def save_checkpoint(visited: set, heap: list, syllabus_queue: set, pdf_link_queue: set, output_dir: Path):
+    with open(checkpoint_path(output_dir), "w", encoding="utf-8") as f:
+        json.dump({
+            "visited": list(visited),
+            "queue": heap,
+            "syllabus_pdfs": list(syllabus_queue),
+            "pdf_links": list(pdf_link_queue),
+        }, f, ensure_ascii=False)
+
+
+def load_checkpoint(output_dir: Path) -> dict | None:
+    cp = checkpoint_path(output_dir)
+    if cp.exists():
+        with open(cp, encoding="utf-8") as f:
+            data = json.load(f)
+        queue_len = len(data["queue"]) if isinstance(data.get("queue"), list) else 0
+        print(f"[RESUME] Checkpoint found: {len(data['visited'])} visited, {queue_len} queued")
+        return data
+
+    visited_urls = []
+    for md_file in output_dir.glob("*.md"):
+        if md_file.name.startswith("_"):
+            continue
+        try:
+            first_line = md_file.read_text(encoding="utf-8").split("\n")[0]
+            if first_line.startswith("# Source: "):
+                visited_urls.append(first_line[10:].strip())
+        except Exception:
+            pass
+
+    if visited_urls:
+        print(f"[RESUME] No checkpoint — rebuilt {len(visited_urls)} visited URLs from existing files")
+        return {"visited": visited_urls, "queue": None, "syllabus_pdfs": [], "pdf_links": []}
+
     return None
 
 
-# ── Boilerplate truncation ────────────────────────────────────────────────────
+# ── BFS crawl ─────────────────────────────────────────────────────────────────
 
-_COOKIE_BAR = re.compile(
-    r"(?:\[Essential cookies only\]|\[Solo cookie necessari\]|"
-    r"\[Accetta tutti i cookie\]|chefcookie__decline|"
-    r"\[Personalizza cookie\]|\[Impostazione cookie\])",
-)
-
-_YOU_ARE_HERE = re.compile(r"You are here:")
-
-_COOKIE_SECTION_START = re.compile(
-    r"#{1,2} (?:This website uses cookies|Questo sito web utilizza i cookie)"
-)
-
-# Markdown scaffolding (nav links, bullets, table pipes) that must not be
-# mistaken for real prose when deciding where the cookie block sits.
-_MD_NOISE = re.compile(r"\[[^\]]*\]\([^)]*\)|\[[^\]]*\]|[#*_>`|\-]+")
+def _priority(url: str, depth: int) -> int:
+    boosted = any(urlparse(url).path.startswith(p) for p in BOOSTED_PREFIXES)
+    return depth * 2 if boosted else depth * 2 + 1
 
 
-def truncate_at_boilerplate(text: str) -> str:
-    m = _COOKIE_BAR.search(text)
-    if m:
-        heading = _COOKIE_SECTION_START.search(text)
-        # Cookie banner at the top (sitoweb pages): remove banner, keep content after
-        # Decide by how much real prose precedes the block, not by its offset:
-        # a short page whose cookie block fell within the first 500 chars used
-        # to have its entire body deleted here. Nav links are stripped first so
-        # a menu-heavy header is not mistaken for content.
-        prose_before = _MD_NOISE.sub("", text[:heading.start()]).strip() if heading else ""
-        if heading and heading.start() < m.start() and len(prose_before) < 200:
-            end_of_line = text.find("\n", m.end())
-            text = text[end_of_line + 1:] if end_of_line != -1 else ""
-        else:
-            # Cookie banner at the bottom (regular pages): keep content before
-            text = text[:m.start()]
+async def crawl(seed_urls: list[str], max_pages: int, output_dir: Path, pdf_dir: Path, concurrency: int, all_pdfs: bool = False, restrict_prefixes: list[str] | None = None):
+    print(f"\n=== CRAWL (max_pages={max_pages}) ===")
+    print(f"Seeds: {seed_urls}\n")
 
-    matches = list(_YOU_ARE_HERE.finditer(text))
-    if len(matches) >= 2:
-        def breadcrumb(match):
-            end = text.find("\n", match.start())
-            return text[match.start(): end if end != -1 else match.start() + 120]
+    _seq = count()
+    heap: list = []
 
-        first_bc = breadcrumb(matches[0])
-        for later in matches[1:]:
-            if breadcrumb(later) == first_bc:
-                text = text[:later.start()]
-                break
+    def enqueue(url: str, depth: int):
+        heapq.heappush(heap, (_priority(url, depth), next(_seq), depth, url))
 
-    return text
+    checkpoint = load_checkpoint(output_dir)
+    if checkpoint and checkpoint["queue"]:
+        visited: set[str] = set(checkpoint["visited"])
+        syllabus_queue: set[str] = set(checkpoint["syllabus_pdfs"])
+        pdf_link_queue: set[str] = set(checkpoint["pdf_links"])
+        for entry in checkpoint["queue"]:
+            score, _old_seq, depth, url = entry
+            heapq.heappush(heap, (score, next(_seq), depth, url))
+        print(f"[RESUME] Full restore: {len(visited)} visited, {len(heap)} queued\n")
+    elif checkpoint:
+        visited: set[str] = set(checkpoint["visited"])
+        syllabus_queue: set[str] = set(checkpoint["syllabus_pdfs"])
+        pdf_link_queue: set[str] = set(checkpoint["pdf_links"])
+        enqueued = 0
+        for base_url in seed_urls:
+            if "corsi.unibo.it" not in base_url:
+                continue
+            for subpage in COURSE_SUBPAGES:
+                url = f"{base_url.rstrip('/')}/{subpage}"
+                if url not in visited:
+                    enqueue(url, 1)
+                    enqueued += 1
+        print(f"[RESUME] Restored {len(visited)} visited URLs — {enqueued} missing sub-pages enqueued\n")
+    else:
+        visited: set[str] = set()
+        syllabus_queue: set[str] = set()
+        pdf_link_queue: set[str] = set()
+        for u in seed_urls:
+            enqueue(u, 0)
+
+    log = []
+    pages_since_checkpoint = 0
+    visited_at_start = len(visited)
+
+    unlimited = max_pages <= 0
+
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        while heap and (unlimited or (len(visited) - visited_at_start) < max_pages):
+            batch = []
+            while heap and len(batch) < concurrency and (unlimited or (len(visited) - visited_at_start) < max_pages):
+                score, _, depth, url = heapq.heappop(heap)
+                if url in visited:
+                    continue
+                visited.add(url)
+                batch.append((score, depth, url))
+
+            if not batch:
+                continue
+
+            results = await asyncio.gather(
+                *[scrape_page(crawler, url, syllabus_queue, pdf_link_queue, output_dir, all_pdfs, restrict_prefixes)
+                  for _, _, url in batch]
+            )
+
+            for (score, depth, url), (ok, children) in zip(batch, results):
+                tag = "*" if score == depth * 2 else " "
+                new_count = len(visited) - visited_at_start
+                limit_str = "∞" if unlimited else str(max_pages)
+                print(f"[{new_count}/{limit_str}] d={depth}{tag} {url}")
+                log.append({"url": url, "status": "ok" if ok else "skip", "depth": depth})
+                for child in children:
+                    if child not in visited:
+                        enqueue(child, depth + 1)
+
+            pages_since_checkpoint += len(batch)
+            if pages_since_checkpoint >= CHECKPOINT_INTERVAL:
+                save_checkpoint(visited, heap, syllabus_queue, pdf_link_queue, output_dir)
+                pages_since_checkpoint = 0
+
+    save_checkpoint(visited, heap, syllabus_queue, pdf_link_queue, output_dir)
+    with open(output_dir / "_crawl_summary.json", "w", encoding="utf-8") as f:
+        json.dump(log, f, indent=2, ensure_ascii=False)
+
+    ok_count = sum(1 for r in log if r["status"] == "ok")
+    print(f"\nPages: {ok_count}/{len(log)} saved → {output_dir}/")
+
+    await process_syllabus_pdfs(syllabus_queue, pdf_dir)
+    save_pdf_links(pdf_link_queue, output_dir)
+
+    failed = [r["url"] for r in log if r["status"] == "skip"]
+    if failed:
+        print(f"\n=== RETRY {len(failed)} FAILED PAGES ===\n")
+        retry_ok = 0
+        async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+            for url in failed:
+                print(f"  Retrying: {url}")
+                ok, _ = await scrape_page(crawler, url, syllabus_queue, pdf_link_queue, output_dir, all_pdfs, restrict_prefixes)
+                if ok:
+                    retry_ok += 1
+        print(f"\nRetry: {retry_ok}/{len(failed)} recovered")
+        await process_syllabus_pdfs(syllabus_queue, pdf_dir)
+        save_pdf_links(pdf_link_queue, output_dir)
 
 
-# ── Residual cleaning ─────────────────────────────────────────────────────────
+# ── Retry mode ────────────────────────────────────────────────────────────────
 
-_COOKIE_HEADING = re.compile(
-    r"#{1,2} (?:This website uses cookies|Questo sito web utilizza i cookie).*?"
-    r"(?=\[Essential cookies only\]|\[Personalizza cookie\]|\[Impostazione cookie\]|\Z)",
-    re.DOTALL,
-)
+async def retry_failed(output_dir: Path, pdf_dir: Path):
+    summary_path = output_dir / "_crawl_summary.json"
+    if not summary_path.exists():
+        print("No _crawl_summary.json found.")
+        return
 
-_COPYRIGHT = re.compile(
-    r"©Copyright\s+\d{4}.*?(?:Note legali\][^\n]*\n?|CF:\s*\d+\n?|Privacy\][^\n]*\n?)",
-    re.DOTALL,
-)
+    with open(summary_path, encoding="utf-8") as f:
+        log = json.load(f)
 
-_MULTI_BLANK = re.compile(r"\n{3,}")
-_TRAILING_WS = re.compile(r"[ \t]+$", re.MULTILINE)
+    failed = [r["url"] for r in log if r["status"] == "skip"]
+    if not failed:
+        print("No failed pages to retry.")
+        return
+
+    print(f"\n=== RETRY {len(failed)} FAILED PAGES ===\n")
+    syllabus_queue: set[str] = set()
+    pdf_link_queue: set[str] = set()
+    retry_ok = 0
+
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        for i, url in enumerate(failed, 1):
+            print(f"[{i}/{len(failed)}] {url}")
+            ok, _ = await scrape_page(crawler, url, syllabus_queue, pdf_link_queue, output_dir)
+            if ok:
+                retry_ok += 1
+                for r in log:
+                    if r["url"] == url:
+                        r["status"] = "ok"
+                        break
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(log, f, indent=2, ensure_ascii=False)
+
+    print(f"\nRetry: {retry_ok}/{len(failed)} recovered")
+    await process_syllabus_pdfs(syllabus_queue, pdf_dir)
+    save_pdf_links(pdf_link_queue, output_dir)
 
 
-def clean_content(text: str) -> str:
-    text = truncate_at_boilerplate(text)
-    text = _COOKIE_HEADING.sub("", text)
-    text = _COPYRIGHT.sub("", text)
-    text = _COOKIE_BAR.sub("", text)   # sibling buttons the truncation left behind
-    text = _TRAILING_WS.sub("", text)
-    text = _MULTI_BLANK.sub("\n\n", text)
-    return text.strip()
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
-
-# ── Main pipeline ─────────────────────────────────────────────────────────────
-
-def main():
+def parse_args():
+    preset_names = ", ".join(PRESET_URLS.keys())
     parser = argparse.ArgumentParser(
-        description="Clean scraped Unibo markdown files.",
+        description="BFS web scraper for the University of Bologna website.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Examples:
-  python clean.py
-  python clean.py --input-dir output_markdown --output-dir output_cleaned
-  python clean.py --min-chars 500
+  python scraper.py
+  python scraper.py --url https://corsi.unibo.it/2cycle/artificial-intelligence
+  python scraper.py --url https://corsi.unibo.it/2cycle/artificial-intelligence \\
+                    --url https://www.unibo.it/en/homepage --max-pages 300
+  python scraper.py --url-file my_courses.txt --max-pages 500
+  python scraper.py --preset ai-msc --max-pages 300
+  python scraper.py --retry
+
+Available presets: {preset_names}
         """,
     )
-    parser.add_argument("--input-dir",  default="output_markdown", metavar="DIR",
-                        help="Directory with raw markdown files (default: output_markdown).")
-    parser.add_argument("--output-dir", default="output_cleaned",  metavar="DIR",
-                        help="Directory for cleaned output files (default: output_cleaned).")
-    parser.add_argument("--min-chars",  type=int, default=MIN_CHARS_DEFAULT, metavar="N",
-                        help=f"Minimum body length to keep a file (default: {MIN_CHARS_DEFAULT}).")
-    args = parser.parse_args()
-
-    input_dir  = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
-    report     = Path("cleaning_report.json")
-    output_dir.mkdir(exist_ok=True)
-
-    md_files = sorted(f for f in input_dir.glob("*.md") if not f.name.startswith("_"))
-    print(f"Input files: {len(md_files)}")
-
-    stats = {"input": len(md_files), "removed_junk": 0,
-             "removed_too_short": 0, "removed_duplicate": 0, "kept": 0}
-    removal_log: list[dict] = []
-    candidates: list[tuple[str, str, str]] = []
-
-    for f in md_files:
-        try:
-            raw = f.read_text(encoding="utf-8")
-        except (FileNotFoundError, OSError):
-            stats["removed_junk"] += 1
-            continue
-
-        lines = raw.split("\n", 1)
-        source_line = lines[0] if lines[0].startswith("# Source:") else ""
-        body_raw = lines[1] if len(lines) > 1 else raw
-
-        reason = is_junk(raw)
-        if reason:
-            stats["removed_junk"] += 1
-            removal_log.append({"file": f.name, "reason": reason})
-            continue
-
-        body_clean = clean_content(body_raw)
-
-        if len(body_clean.strip()) < args.min_chars:
-            stats["removed_too_short"] += 1
-            removal_log.append({"file": f.name, "reason": "too_short"})
-            continue
-
-        candidates.append((f.name, source_line, body_clean))
-
-    print(f"After junk+length filter: {len(candidates)} files remain")
-
-    hash_groups: dict[str, list] = defaultdict(list)
-    for fname, src, body in candidates:
-        h = hashlib.md5(body.encode()).hexdigest()
-        hash_groups[h].append((fname, src, body))
-
-    for group in hash_groups.values():
-        group.sort(key=lambda x: (len(x[0]), x[0]))
-        keeper_fname, keeper_src, keeper_body = group[0]
-
-        out_path = output_dir / keeper_fname
-        out_path.write_text((keeper_src + "\n\n" + keeper_body).strip() + "\n", encoding="utf-8")
-        stats["kept"] += 1
-
-        for dup_fname, _, _ in group[1:]:
-            stats["removed_duplicate"] += 1
-            removal_log.append({"file": dup_fname, "reason": "duplicate", "kept_as": keeper_fname})
-
-    print("\n=== Cleaning Summary ===")
-    print(f"  Input:               {stats['input']:>6}")
-    print(f"  Removed (junk):      {stats['removed_junk']:>6}  (login pages, 404s)")
-    print(f"  Removed (too short): {stats['removed_too_short']:>6}  (< {args.min_chars} chars)")
-    print(f"  Removed (duplicate): {stats['removed_duplicate']:>6}")
-    print(f"  ─────────────────────────────────")
-    print(f"  Kept:                {stats['kept']:>6}  → {output_dir}/")
-
-    stats["removal_log_count"] = len(removal_log)
-    report.write_text(
-        json.dumps({"stats": stats, "removed": removal_log}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    parser.add_argument(
+        "--url", action="append", dest="urls", metavar="URL",
+        help="Seed URL to start crawling from (can be repeated).",
     )
-    print(f"\nFull report → {report}")
+    parser.add_argument(
+        "--url-file", metavar="FILE",
+        help="Path to a text file with seed URLs, one per line (# lines are ignored).",
+    )
+    parser.add_argument(
+        "--preset", choices=list(PRESET_URLS.keys()), metavar="NAME",
+        help=f"Use a predefined set of course seed URLs. Choices: {preset_names}.",
+    )
+    parser.add_argument(
+        "--max-pages", type=int, default=5000, metavar="N",
+        help="Maximum number of NEW pages to crawl per run (default: 5000).",
+    )
+    parser.add_argument(
+        "--output-dir", default="output_markdown", metavar="DIR",
+        help="Directory for saved markdown files (default: output_markdown).",
+    )
+    parser.add_argument(
+        "--pdf-dir", default="output_pdf", metavar="DIR",
+        help="Directory for extracted PDF text files (default: output_pdf).",
+    )
+    parser.add_argument(
+        "--concurrency", type=int, default=5, metavar="N",
+        help="Number of pages crawled in parallel (default: 5).",
+    )
+    parser.add_argument(
+        "--all-pdfs", action="store_true",
+        help="Extract text from all PDFs found, not just those linked from corsi.unibo.it.",
+    )
+    parser.add_argument(
+        "--restrict-prefix", action="append", dest="restrict_prefixes", metavar="URL_PREFIX",
+        help="Only follow links that start with this URL prefix (can be repeated). "
+             "Professor pages (/sitoweb/) are always allowed as an exception.",
+    )
+    parser.add_argument(
+        "--retry", action="store_true",
+        help="Retry previously failed pages from _crawl_summary.json.",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    output_dir = Path(args.output_dir)
+    pdf_dir = Path(args.pdf_dir)
+    output_dir.mkdir(exist_ok=True)
+    pdf_dir.mkdir(exist_ok=True)
+
+    if args.retry:
+        asyncio.run(retry_failed(output_dir, pdf_dir))
+    else:
+        # URL priority: --url > --url-file > --preset > built-in defaults
+        seed_urls: list[str] = []
+
+        if args.urls:
+            seed_urls.extend(args.urls)
+
+        if args.url_file:
+            url_file = Path(args.url_file)
+            if not url_file.exists():
+                print(f"[ERROR] --url-file not found: {url_file}")
+                raise SystemExit(1)
+            file_urls = [
+                line.strip()
+                for line in url_file.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            print(f"[URL-FILE] Loaded {len(file_urls)} URLs from {url_file}")
+            seed_urls.extend(file_urls)
+
+        if args.preset:
+            preset_urls = PRESET_URLS[args.preset]
+            print(f"[PRESET] '{args.preset}': {len(preset_urls)} seed URLs")
+            seed_urls.extend(preset_urls)
+
+        if not seed_urls:
+            seed_urls = DEFAULT_SEED_URLS
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        seed_urls = [u for u in seed_urls if not (u in seen or seen.add(u))]
+
+        asyncio.run(crawl(seed_urls, args.max_pages, output_dir, pdf_dir, args.concurrency, args.all_pdfs, args.restrict_prefixes))
