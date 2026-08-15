@@ -3,6 +3,7 @@
 A BFS web scraper for the University of Bologna website
 (`unibo.it`, `corsi.unibo.it`, `eng.unibo.it`).
 Crawls English-only pages, converts HTML to Markdown, and extracts text from course PDFs.
+Includes a script (clean.py) to sanitize extracted text, remove noise, and normalize the Markdown output for optimal RAG performance
 
 ## Installation
 
