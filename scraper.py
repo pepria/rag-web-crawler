@@ -9,12 +9,10 @@ Usage:
   python scraper.py --url URL1 --url URL2 --max-pages 200
   python scraper.py --retry
 """
+
 import argparse
 import asyncio
-import hashlib        
-import heapq
-import argparse
-import asyncio
+import hashlib
 import heapq
 import re
 import json
@@ -122,8 +120,10 @@ def url_to_filename(url: str, ext: str = ".md") -> str:
     parsed = urlparse(url)
     name = parsed.netloc + parsed.path
     name = re.sub(r"[^\w\-]", "_", name).strip("_")
+    # Digest of the FULL url: two long URLs sharing a 160-char prefix would
+    # otherwise collide and the second page be dropped by the exists() branch.
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
-    return f"{name[:160]}__{digest}{ext}
+    return f"{name[:160]}__{digest}{ext}"
 
 
 def is_shallow_url(url: str) -> bool:
@@ -171,7 +171,11 @@ def collect_links(result, source_url: str, all_pdfs: bool = False, restrict_pref
 
         page_links.append(href.split("?")[0])
 
+    # sorted(), not list(set()): string hashing is randomised per process, so
+    # list(set(...)) changes the BFS enqueue order every run, which changes
+    # which pages survive the --max-pages cut.
     return sorted(set(page_links)), sorted(set(syllabus_pdfs)), sorted(set(other_pdfs))
+
 
 # ── PDF handling ──────────────────────────────────────────────────────────────
 
