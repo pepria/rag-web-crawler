@@ -33,11 +33,16 @@ MIN_CHARS_DEFAULT = 200
 # ── Junk detection ────────────────────────────────────────────────────────────
 
 JUNK_SIGNALS = [
-    "用户帐户",
-    "使我保持登录状态",
+    # login
+    "用户帐户", "User account", "Account utente",
+    "使我保持登录状态", "Keep me signed in", "Ricordami",
     "Enter the University institutional credentials",
+    "Inserisci le credenziali istituzionali",
+    # errors
     "We can't find the page you are looking for",
     "Sorry, the requested page cannot be found",
+    "Non riusciamo a trovare la pagina",
+    "页面未找到",
 ]
 
 
@@ -68,7 +73,8 @@ def truncate_at_boilerplate(text: str) -> str:
     if m:
         heading = _COOKIE_SECTION_START.search(text)
         # Cookie banner at the top (sitoweb pages): remove banner, keep content after
-        if heading and heading.start() < m.start() and heading.start() < 500:
+        if heading and heading.start() < m.start() \
+                and len(text[:heading.start()].strip()) < 200:
             end_of_line = text.find("\n", m.end())
             text = text[end_of_line + 1:] if end_of_line != -1 else ""
         else:
@@ -113,6 +119,9 @@ def clean_content(text: str) -> str:
     text = _COPYRIGHT.sub("", text)
     text = _TRAILING_WS.sub("", text)
     text = _MULTI_BLANK.sub("\n\n", text)
+    text = _COPYRIGHT.sub("", text)
+    text = _COOKIE_BAR.sub("", text)   # sibling buttons the truncation left behind
+    text = _TRAILING_WS.sub("", text)
     return text.strip()
 
 
