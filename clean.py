@@ -32,6 +32,8 @@ MIN_CHARS_DEFAULT = 200
 
 # ── Junk detection ────────────────────────────────────────────────────────────
 
+# These pages render in the language of the browser session, so every signal
+# must be listed in all three locales or junk leaks through on another machine.
 JUNK_SIGNALS = [
     # login
     "用户帐户", "User account", "Account utente",
@@ -67,14 +69,22 @@ _COOKIE_SECTION_START = re.compile(
     r"#{1,2} (?:This website uses cookies|Questo sito web utilizza i cookie)"
 )
 
+# Markdown scaffolding (nav links, bullets, table pipes) that must not be
+# mistaken for real prose when deciding where the cookie block sits.
+_MD_NOISE = re.compile(r"\[[^\]]*\]\([^)]*\)|\[[^\]]*\]|[#*_>`|\-]+")
+
 
 def truncate_at_boilerplate(text: str) -> str:
     m = _COOKIE_BAR.search(text)
     if m:
         heading = _COOKIE_SECTION_START.search(text)
         # Cookie banner at the top (sitoweb pages): remove banner, keep content after
-        if heading and heading.start() < m.start() \
-                and len(text[:heading.start()].strip()) < 200:
+        # Decide by how much real prose precedes the block, not by its offset:
+        # a short page whose cookie block fell within the first 500 chars used
+        # to have its entire body deleted here. Nav links are stripped first so
+        # a menu-heavy header is not mistaken for content.
+        prose_before = _MD_NOISE.sub("", text[:heading.start()]).strip() if heading else ""
+        if heading and heading.start() < m.start() and len(prose_before) < 200:
             end_of_line = text.find("\n", m.end())
             text = text[end_of_line + 1:] if end_of_line != -1 else ""
         else:
@@ -117,11 +127,9 @@ def clean_content(text: str) -> str:
     text = truncate_at_boilerplate(text)
     text = _COOKIE_HEADING.sub("", text)
     text = _COPYRIGHT.sub("", text)
-    text = _TRAILING_WS.sub("", text)
-    text = _MULTI_BLANK.sub("\n\n", text)
-    text = _COPYRIGHT.sub("", text)
     text = _COOKIE_BAR.sub("", text)   # sibling buttons the truncation left behind
     text = _TRAILING_WS.sub("", text)
+    text = _MULTI_BLANK.sub("\n\n", text)
     return text.strip()
 
 
